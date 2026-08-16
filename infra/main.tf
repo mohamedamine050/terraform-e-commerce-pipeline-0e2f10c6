@@ -369,38 +369,230 @@ resource "aws_sfn_state_machine" "pipeline" {
   role_arn = aws_iam_role.stepfn_role.arn
 
   definition = jsonencode({
-    Comment = "State machine to run Glue jobs sequentially"
-    StartAt = "Landing"
+    Comment = "Complete pipeline orchestration"
+
+    StartAt = "Producer"
+
     States = {
+
+      # ============================================================
+      # 1. Producer Lambda
+      # ============================================================
+
+      Producer = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+
+        Parameters = {
+          FunctionName = aws_lambda_function.producer.arn
+
+          Payload = {
+            "execution_id.$" = "$$.Execution.Id"
+          }
+        }
+
+        OutputPath = "$.Payload"
+
+        Next = "SendToSQS"
+
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            Next        = "PipelineFailed"
+          }
+        ]
+      }
+
+
+      # ============================================================
+      # 2. Send message to SQS
+      # ============================================================
+
+      SendToSQS = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::sqs:sendMessage"
+
+        Parameters = {
+          QueueUrl = aws_sqs_queue.queue.url
+
+          MessageBody = {
+            "execution_id.$" = "$$.Execution.Id"
+            "data.$"         = "$"
+          }
+        }
+
+        Next = "Streamer"
+
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            Next        = "PipelineFailed"
+          }
+        ]
+      }
+
+
+      # ============================================================
+      # 3. Streamer Lambda
+      # ============================================================
+
+      Streamer = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+
+        Parameters = {
+          FunctionName = aws_lambda_function.streamer.arn
+
+          Payload = {
+            "execution_id.$" = "$$.Execution.Id"
+          }
+        }
+
+        OutputPath = "$.Payload"
+
+        Next = "Landing"
+
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            Next        = "PipelineFailed"
+          }
+        ]
+      }
+
+
+      # ============================================================
+      # 4. Glue Landing
+      # ============================================================
+
       Landing = {
-        Type       = "Task"
-        Resource   = "arn:aws:states:::glue:startJobRun.sync"
-        Parameters = { JobName = aws_glue_job.jobs["landing"].name }
-        Next       = "Processing"
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+
+        Parameters = {
+          JobName = aws_glue_job.jobs["landing"].name
+        }
+
+        Next = "Processing"
+
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            Next        = "PipelineFailed"
+          }
+        ]
       }
+
+
+      # ============================================================
+      # 5. Glue Processing
+      # ============================================================
+
       Processing = {
-        Type       = "Task"
-        Resource   = "arn:aws:states:::glue:startJobRun.sync"
-        Parameters = { JobName = aws_glue_job.jobs["processing"].name }
-        Next       = "Quality"
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+
+        Parameters = {
+          JobName = aws_glue_job.jobs["processing"].name
+        }
+
+        Next = "Quality"
+
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            Next        = "PipelineFailed"
+          }
+        ]
       }
+
+
+      # ============================================================
+      # 6. Glue Quality
+      # ============================================================
+
       Quality = {
-        Type       = "Task"
-        Resource   = "arn:aws:states:::glue:startJobRun.sync"
-        Parameters = { JobName = aws_glue_job.jobs["quality"].name }
-        Next       = "SilverGold"
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+
+        Parameters = {
+          JobName = aws_glue_job.jobs["quality"].name
+        }
+
+        Next = "SilverGold"
+
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            Next        = "PipelineFailed"
+          }
+        ]
       }
+
+
+      # ============================================================
+      # 7. Glue Silver / Gold
+      # ============================================================
+
       SilverGold = {
-        Type       = "Task"
-        Resource   = "arn:aws:states:::glue:startJobRun.sync"
-        Parameters = { JobName = aws_glue_job.jobs["silvergold"].name }
-        Next       = "RdsLoad"
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+
+        Parameters = {
+          JobName = aws_glue_job.jobs["silvergold"].name
+        }
+
+        Next = "RdsLoad"
+
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            Next        = "PipelineFailed"
+          }
+        ]
       }
+
+
+      # ============================================================
+      # 8. Glue RDS Load
+      # ============================================================
+
       RdsLoad = {
-        Type       = "Task"
-        Resource   = "arn:aws:states:::glue:startJobRun.sync"
-        Parameters = { JobName = aws_glue_job.jobs["rdsload"].name }
-        End        = true
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+
+        Parameters = {
+          JobName = aws_glue_job.jobs["rdsload"].name
+        }
+
+        Next = "PipelineSucceeded"
+
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            Next        = "PipelineFailed"
+          }
+        ]
+      }
+
+
+      # ============================================================
+      # SUCCESS
+      # ============================================================
+
+      PipelineSucceeded = {
+        Type = "Succeed"
+      }
+
+
+      # ============================================================
+      # FAILURE
+      # ============================================================
+
+      PipelineFailed = {
+        Type  = "Fail"
+        Error = "PipelineExecutionFailed"
+        Cause = "A pipeline step failed"
       }
     }
   })
